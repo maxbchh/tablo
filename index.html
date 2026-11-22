@@ -1333,6 +1333,7 @@ function boardRows(now){
     const stObj=activeStationObj();
     if(stObj){
       for(const tr of currentTrips()){
+        if(tr.manualOnlyStation&&tr.manualOnlyStation!==stObj.id)continue;
         const s=railStatus(tr,stObj.id,now);
         if(s.code==='gone'&&!(tr.gone&&tr.pinned))continue;
         const cat=CATS[tr.cat]||CATS.RE;
@@ -1888,8 +1889,7 @@ function initConductorSync(){
       if(status==='SUBSCRIBED'){setConductorSync('Связь с Кондуктором активна','ok');syncConductorTrip()}
       else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED')setConductorSync('Realtime недоступен · проверка по таймеру','error');
     });
-  syncConductorTrip();
-  initTabloCloudState();
+  initTabloCloudState().finally(()=>syncConductorTrip());
   setInterval(syncConductorTrip,15000);
 }
 

@@ -172,6 +172,19 @@ body.matte .glass{opacity:0}
 .caption{display:flex; flex-wrap:wrap; gap:6px 16px; justify-content:space-between; margin:11px 4px 0;
   font-size:11px; color:var(--mut2); font-weight:600; letter-spacing:.03em}
 .caption kbd{font-family:var(--mono); font-size:10px; background:#141b25; border:1px solid var(--line); border-bottom-width:2px; border-radius:4px; padding:1px 5px; color:var(--mut)}
+.quick-entry{margin-top:15px;padding:13px 14px;border:1px solid #35445a;border-radius:12px;background:linear-gradient(180deg,#171f2b,#0e141d);box-shadow:0 12px 30px rgba(0,0,0,.28)}
+.quick-entry-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:9px}
+.quick-entry-head b{font-family:var(--disp);font-size:11px;letter-spacing:.1em;color:var(--amber)}
+.quick-entry-head small{display:block;color:var(--mut2);font-size:10.5px;font-weight:700;margin-top:2px}
+.quick-entry-head kbd{font:700 10px var(--mono);color:var(--green);border:1px solid #1c4a33;background:#0e1a15;border-radius:5px;padding:3px 7px}
+.quick-entry-row{display:flex;align-items:center;gap:9px;min-width:0;background:#080d13;border:1px solid #34445a;border-radius:9px;padding:6px 7px 6px 10px}
+.quick-entry-prompt{font:700 11px var(--mono);color:var(--green);white-space:nowrap}
+.quick-entry-row input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--ink);font:600 12px var(--mono);padding:7px 0}
+.quick-entry-row input::placeholder{color:#68798c}
+.quick-entry-row button{border:1px solid #6b5218;background:linear-gradient(180deg,#ffcf6e,var(--amber2));color:#1a1206;border-radius:7px;padding:8px 12px;font-size:11.5px;font-weight:900;white-space:nowrap}
+.quick-entry-row button:disabled{opacity:.42;cursor:not-allowed;filter:grayscale(.6)}
+.quick-entry-hint{margin-top:8px;color:var(--mut2);font-size:10.5px;font-weight:600;line-height:1.5}
+@media(max-width:640px){.quick-entry{padding:10px}.quick-entry-row{flex-wrap:wrap}.quick-entry-prompt{font-size:10px}.quick-entry-row input{flex-basis:calc(100% - 105px)}.quick-entry-row button{margin-left:auto}}
 .sr{position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0)}
 
 /* ── console ───────────────────────────────────── */
@@ -520,6 +533,18 @@ input[type=checkbox]:indeterminate::after{content:''; position:absolute; left:3p
         <span>Симуляция. Не является официальным расписанием Белорусской железной дороги.</span>
         <span><kbd>Пробел</kbd> пауза · <kbd>Ctrl</kbd>+<kbd>Z</kbd> отменить действие</span>
       </div>
+      <div class="quick-entry" id="quickEntry">
+        <div class="quick-entry-head">
+          <div><b>БЫСТРЫЙ ВВОД · КОМАНДНАЯ СТРОКА</b><small id="quickEntryContext">Добавление поезда на выбранную станцию</small></div>
+          <kbd>ENTER ↵</kbd>
+        </div>
+        <div class="quick-entry-row">
+          <span class="quick-entry-prompt">дсп@табло:~$</span>
+          <input id="quickCommand" type="text" autocomplete="off" spellcheck="false" placeholder="6001 Минск — Гомель 08:57 09:02 путь 3" aria-label="Команда добавления поезда">
+          <button id="quickCommandRun" data-action="quick-rail-add" type="button">На табло ↵</button>
+        </div>
+        <p class="quick-entry-hint" id="quickEntryHint">Формат: номер · сообщение · прибытие · отправление · путь. Команда добавит поезд на выбранную станцию.</p>
+      </div>
     </div>
   </section>
 
@@ -767,6 +792,8 @@ const CONDUCTOR_SUPABASE_KEY='sb_publishable_Ur6yP5_7LQ-9DGmriBJIpw_zIWJiM7T';
 const CONDUCTOR_CITY_ID='conductor-live-city';
 let conductorClient=null,conductorChannel=null,conductorSyncTimer=null,conductorSyncBusy=false;
 let conductorLiveShiftId=null,conductorPreviousView=null,conductorLastStopIndex=null;
+let tabloStateChannel=null,tabloCloudTimer=null,tabloCloudReady=false,tabloCloudSaving=false;
+let tabloCloudDirty=false,tabloApplyingRemote=false,tabloLastCloudUpdatedAt=0,tabloCloudWarned=false;
 
 /* ═══════════════ ШРИФТ 5×7 (LED-матрица) ═══════════════ */
 const F={};
@@ -1002,8 +1029,77 @@ function persistentState(){
   }
   return copy;
 }
-const saveNow=()=>{try{localStorage.setItem(KEY,JSON.stringify(persistentState()));const el=$('saveInfo');if(el)el.textContent='Сохранено в браузере · '+fmtSec(state.sim.sec)}catch(e){}};
+const saveNow=()=>{
+  try{localStorage.setItem(KEY,JSON.stringify(persistentState()));const el=$('saveInfo');if(el)el.textContent='Сохранено локально · '+fmtSec(state.sim.sec)}catch(e){}
+  queueTabloCloudSave();
+};
 const save=debounce(saveNow,700);
+function queueTabloCloudSave(){
+  if(!conductorClient||!tabloCloudReady||tabloApplyingRemote)return;
+  tabloCloudDirty=true;
+  clearTimeout(tabloCloudTimer);
+  tabloCloudTimer=setTimeout(saveTabloCloudState,900);
+}
+async function saveTabloCloudState(){
+  if(!conductorClient||!tabloCloudReady||tabloApplyingRemote||tabloCloudSaving||!tabloCloudDirty)return;
+  tabloCloudSaving=true;
+  tabloCloudDirty=false;
+  try{
+    const payload={id:'main',state:persistentState(),updated_at:new Date().toISOString()};
+    const q=await conductorClient.from('tablo_state').upsert(payload,{onConflict:'id'}).select('updated_at').single();
+    if(q.error)throw q.error;
+    const stamp=Date.parse(q.data.updated_at);
+    if(Number.isFinite(stamp))tabloLastCloudUpdatedAt=Math.max(tabloLastCloudUpdatedAt,stamp);
+    const el=$('saveInfo');if(el)el.textContent='Сохранено в общей базе · '+fmtSec(state.sim.sec);
+  }catch(error){
+    console.error('Tablo cloud save:',error);
+    const el=$('saveInfo');if(el)el.textContent='Локальная копия сохранена · ошибка общей базы';
+    if(!tabloCloudWarned){tabloCloudWarned=true;toast('Не удалось сохранить табло в общей базе: '+(error.message||String(error)),'danger')}
+  }finally{
+    tabloCloudSaving=false;
+    if(tabloCloudDirty)queueTabloCloudSave();
+  }
+}
+function applyRemoteTabloState(row){
+  if(!row||!row.state||typeof row.state!=='object')return;
+  const stamp=Date.parse(row.updated_at||'');
+  if(Number.isFinite(stamp)&&stamp<=tabloLastCloudUpdatedAt)return;
+  if(Number.isFinite(stamp))tabloLastCloudUpdatedAt=stamp;
+  tabloApplyingRemote=true;
+  try{
+    state=normalize(row.state);
+    selection.clear();closeDrawer();prevStatus={};statusInit=false;lastMin=Math.floor(state.sim.sec/60);
+    try{localStorage.setItem(KEY,JSON.stringify(persistentState()))}catch(e){}
+    renderAll();boardDirty=true;renderSr();
+    const el=$('saveInfo');if(el)el.textContent='Получены общие изменения · '+fmtSec(state.sim.sec);
+  }finally{
+    tabloApplyingRemote=false;
+  }
+}
+async function initTabloCloudState(){
+  if(!conductorClient)return;
+  try{
+    const q=await conductorClient.from('tablo_state').select('state,updated_at').eq('id','main').maybeSingle();
+    if(q.error)throw q.error;
+    if(q.data){
+      const stamp=Date.parse(q.data.updated_at||'');
+      if(Number.isFinite(stamp))tabloLastCloudUpdatedAt=stamp;
+      applyRemoteTabloState(q.data);
+    }
+    tabloCloudReady=true;
+    if(!q.data){tabloCloudDirty=true;await saveTabloCloudState()}
+    tabloStateChannel=conductorClient.channel('tablo-shared-settings')
+      .on('postgres_changes',{event:'*',schema:'public',table:'tablo_state'},payload=>applyRemoteTabloState(payload.new))
+      .subscribe(status=>{
+        if(status==='CHANNEL_ERROR'||status==='TIMED_OUT')console.warn('Tablo shared state Realtime:',status);
+      });
+  }catch(error){
+    tabloCloudReady=true;
+    console.error('Tablo cloud init:',error);
+    const el=$('saveInfo');if(el)el.textContent='Облачная синхронизация не подключена · локальное сохранение работает';
+  }
+}
+
 function pushUndo(label){undoStack.push({label,snap:JSON.stringify(state)});if(undoStack.length>15)undoStack.shift()}
 function undo(){
   const u=undoStack.pop();
@@ -1051,8 +1147,12 @@ function autoRoute(tr){
 }
 const routeOf=tr=>(tr.route&&tr.route.trim())||autoRoute(tr);
 function railAt(tr,stationId){
+  if(tr.manualOnlyStation&&tr.manualOnlyStation!==stationId)return null;
   const stops=trainStops(tr);
-  return stops.find(s=>s.id===stationId)||null;
+  const base=stops.find(s=>s.id===stationId);
+  if(!base)return null;
+  const manual=tr.manualTimes&&tr.manualTimes[stationId];
+  return manual?{...base,arr:manual.arr==null?base.arr:manual.arr,dep:manual.dep==null?base.dep:manual.dep}:base;
 }
 function railStatus(tr,pointId,now){
   const p=railAt(tr,pointId);
@@ -1146,8 +1246,8 @@ function announce(kindName,tr,pointName,evt){
     else if(evt==='dep')txt=pre+'Поезд номер '+tr.num+' отправляется с '+tr.track+' пути.';
     else if(evt==='arrived')txt=pre+'Поезд номер '+tr.num+', сообщением '+routeOf(tr)+', прибыл на '+tr.track+' путь.';
   }else{
-    if(evt==='arriv')txt=pre+KINDS[tr.kind].name+' номер '+tr.num+', направление '+tr.dest+'. Прибывает на платформу '+tr.plat+'.';
-    else if(evt==='board')txt=pre+KINDS[tr.kind].name+' номер '+tr.num+', направление '+tr.dest+'. Посадка на платформе '+tr.plat+'.';
+    if(evt==='arriv')txt=pre+KINDS[tr.kind].name+' номер '+tr.num+', направление '+tr.dest+'. Прибывает'+(tr.plat&&tr.plat!=='—'?' на платформу '+tr.plat:'')+'.';
+    else if(evt==='board')txt=pre+KINDS[tr.kind].name+' номер '+tr.num+', направление '+tr.dest+'. Посадка'+(tr.plat&&tr.plat!=='—'?' на платформе '+tr.plat:'')+'.';
   }
   if(txt){speak(txt);log('Диктор: '+txt,'info')}
 }
@@ -1662,8 +1762,15 @@ function renderSr(){
     const c=r.cells;return (c.num?c.num.t:'')+' '+(c.route?c.route.t:c.dest?c.dest.t:'')+' '+(c.dep?c.dep.t:c.time?c.time.t:'');
   }).join('; ');
 }
+function renderQuickEntry(){
+  const sec=activeSec(),station=activeStationObj(),button=$('quickCommandRun');
+  const ready=state.mode==='rail'&&!!sec&&!!station;
+  if($('quickEntryContext'))$('quickEntryContext').textContent=ready?'Участок: '+sec.name+' · станция: '+station.name:'Переключись на режим ЖД и выбери станцию';
+  if($('quickEntryHint'))$('quickEntryHint').textContent=ready?'Формат: номер · сообщение · прибытие · отправление · путь (необязательно). Например: 6001 Минск — Гомель 08:57 09:02 путь 3':'Быстрый ввод поездов доступен в режиме ЖД после выбора участка и станции.';
+  if(button)button.disabled=!ready;
+}
 function renderAll(){
-  renderTopbar();renderControls();renderChips();renderTimeStrip();renderTabs();
+  renderTopbar();renderControls();renderChips();renderTimeStrip();renderTabs();renderQuickEntry();
   renderTab1();renderTab2();renderTab3();
   boardDirty=true;fitBoard();renderSr();
 }
@@ -1721,13 +1828,6 @@ async function syncConductorTrip(){
       setConductorSync('Маршрут не найден','error');
       return;
     }
-    let vehicle=null;
-    if(shift.vehicle_id){
-      const vehicleQuery=await conductorClient.from('conductor_vehicles')
-        .select('number,model').eq('id',shift.vehicle_id).maybeSingle();
-      if(vehicleQuery.error)throw vehicleQuery.error;
-      vehicle=vehicleQuery.data;
-    }
     const isNewShift=conductorLiveShiftId!==shift.id;
     if(isNewShift){
       conductorPreviousView={mode:state.mode,activeCity:state.city.activeCity,activeStop:state.city.activeStop};
@@ -1755,7 +1855,7 @@ async function syncConductorTrip(){
       id:'conductor-live-'+shift.id,city:CONDUCTOR_CITY_ID,kind:'bus',
       num:String(route.name||'—'),dest:stopNames[endIndex]||stopNames[stopNames.length-1],
       stop:city.stops[currentIndex].id,time:startTime==null?Math.floor(state.sim.sec/60):startTime,
-      plat:String(vehicle?.number||shift.vehicle_label||'—'),delay:0,
+      plat:'—',delay:0,
       cancelled:false,gone:false,pinned:true,conductorLive:true
     });
     const stopChanged=conductorLastStopIndex!==currentIndex;
@@ -1791,6 +1891,7 @@ function initConductorSync(){
       else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED')setConductorSync('Realtime недоступен · проверка по таймеру','error');
     });
   syncConductorTrip();
+  initTabloCloudState();
   setInterval(syncConductorTrip,15000);
 }
 
@@ -1966,6 +2067,37 @@ function addTrain(){
   toast('Поезд №'+num+' добавлен в график','ok');
   $('fNum').value='';$('fRoute').value='';
   renderChips();renderDispatch();renderTab1();boardDirty=true;save();flicker();
+}
+function addQuickRailCommand(){
+  if(state.mode!=='rail'){toast('Для этой команды переключись на режим ЖД','warn');return}
+  const sec=activeSec(),station=activeStationObj();
+  if(!sec||!station){toast('Сначала выбери участок и станцию','warn');return}
+  const input=$('quickCommand'),raw=input.value.trim();
+  if(!raw){need(input);return}
+  const times=[...raw.matchAll(/(?:^|\s)((?:[01]?\d|2[0-3]):[0-5]\d)(?=\s|$)/g)];
+  if(times.length!==2){toast('Нужно указать два времени: прибытие и отправление','warn');need(input);return}
+  const firstTimeIndex=times[0].index+times[0][0].length-times[0][1].length;
+  const secondTimeIndex=times[1].index+times[1][0].length-times[1][1].length;
+  const head=raw.slice(0,firstTimeIndex).trim();
+  const tail=raw.slice(secondTimeIndex+times[1][1].length).trim();
+  const parts=head.split(/\s+/),num=parts.shift()||'',message=parts.join(' ').trim();
+  if(!/^[0-9A-Za-zА-Яа-я_-]{1,12}$/.test(num)||!message){toast('Команда должна начинаться с номера и сообщения поезда','warn');need(input);return}
+  const trackMatch=tail?tail.match(/^(?:путь|платформа|пл\.?)\s*([0-9A-Za-zА-Яа-я_-]{1,8})$/i):null;
+  if(tail&&!trackMatch){toast('После времени можно указать только «путь 3»','warn');need(input);return}
+  const arr=parseTime(times[0][1]),dep=parseTime(times[1][1]);
+  if(arr==null||dep==null){toast('Проверь формат времени ЧЧ:ММ','warn');need(input);return}
+  const track=trackMatch?trackMatch[1]:'—';
+  pushUndo('быстрое добавление поезда №'+num);
+  const train={id:uid(),sec:sec.id,num,cat:'RE',route:message,side:'—',
+    dep0:dep,dwell:Math.max(0,dep-arr),dir:1,track,delay:0,cancelled:false,gone:false,pinned:false,
+    manualOnlyStation:station.id,manualTimes:{[station.id]:{arr,dep}}};
+  state.rail.trains.push(train);
+  state.rail.activeSection=sec.id;
+  log('Быстрый ввод: поезд №'+num+', '+message+', прибытие '+fmtMin(arr)+', отправление '+fmtMin(dep)+', станция '+station.name+'.','ok');
+  toast('Поезд №'+num+' добавлен на '+station.name,'ok');
+  input.value='';
+  prevStatus={};statusInit=false;
+  renderAll();boardDirty=true;save();flicker();
 }
 function addCityTrips(){
   const city=activeCity();
@@ -2195,6 +2327,7 @@ document.addEventListener('click',e=>{
       case 'calc':renderPreview(true);toast('Расписание рассчитано по перегонам','info');break;
       case 'train-add':addTrain();break;
       case 'city-add':addCityTrips();break;
+      case 'quick-rail-add':addQuickRailCommand();break;
       case 'filter':state.ui.filter=v;renderDispatch();save();break;
       case 'row-edit':openDrawer(id);break;
       case 'row-cancel':toggleCancel(id);break;
@@ -2324,6 +2457,7 @@ document.addEventListener('change',e=>{
     el.value='';return;
   }
 });
+document.addEventListener('keydown',e=>{if(e.target&&e.target.id==='quickCommand'&&e.key==='Enter'){e.preventDefault();addQuickRailCommand()}});
 /* drag & drop станций */
 let dragIdx=null;
 $('stationList').addEventListener('dragstart',e=>{

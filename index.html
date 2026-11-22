@@ -6,6 +6,7 @@
 <title>ТАБЛО·ПУЛЬТ — симулятор вокзального табло и диспетчерской</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <link href="https://fonts.googleapis.com/css2?family=Russo+One&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -80,6 +81,13 @@ svg.ic{width:17px; height:17px; flex:none; display:block}
   text-shadow:0 0 12px rgba(255,182,61,.4)}
 .clockchip .dot{width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green); animation:pulse 2s infinite}
 .clockchip.paused .dot{background:var(--warn); box-shadow:0 0 8px var(--warn); animation:none}
+.syncchip{display:flex;align-items:center;gap:7px;max-width:190px;padding:7px 10px;border:1px solid var(--line);border-radius:9px;background:#0d1219;color:var(--mut2);font-size:10.5px;font-weight:800;white-space:nowrap}
+.syncchip i{width:7px;height:7px;border-radius:50%;flex:none;background:var(--warn)}
+.syncchip.ok{color:var(--green);border-color:#1c4a33;background:#0e1a15}
+.syncchip.ok i{background:var(--green);box-shadow:0 0 8px var(--green)}
+.syncchip.error{color:var(--red);border-color:#4a1c24;background:#1c1216}
+.syncchip.error i{background:var(--red);box-shadow:0 0 8px var(--red)}
+@media(max-width:640px){.syncchip{font-size:9px;padding:6px 8px;max-width:150px}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .iconbtn{display:inline-flex; align-items:center; justify-content:center; gap:7px; width:38px; height:38px;
   border-radius:9px; border:1px solid var(--line); background:#10161f; color:var(--mut); transition:all .16s}
@@ -459,6 +467,7 @@ input[type=checkbox]:indeterminate::after{content:''; position:absolute; left:3p
   </div>
   <div class="spacer"></div>
   <div class="clockchip" id="clockChip"><span class="dot"></span><span id="clockChipT">08:18</span></div>
+  <div class="syncchip" id="conductorSync" title="Связь с рейсами сайта «Кондуктор»" aria-live="polite"><i></i><span>Кондуктор: подключение…</span></div>
   <button class="iconbtn on" id="btnSound" data-action="sound" title="Звук: диктор и куранты" aria-pressed="true"><svg class="ic"><use href="#i-sound"/></svg></button>
   <button class="iconbtn wide" id="btnConsole" data-action="console" aria-expanded="true" title="Показать / скрыть пульт"><svg class="ic"><use href="#i-panel"/></svg>Пульт</button>
 </header>
@@ -753,6 +762,11 @@ const fmtSec=s=>{s=((Math.floor(s)%86400)+86400)%86400;return pad2(Math.floor(s/
 const parseTime=v=>{const m=/^(\d{1,2}):(\d{2})/.exec(String(v||''));return m?clamp(+m[1],0,23)*60+clamp(+m[2],0,59):null};
 const debounce=(fn,ms)=>{let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}};
 const KEY='tablo-pult-v3';
+const CONDUCTOR_SUPABASE_URL='https://yycaxmfljqzfkjukplkz.supabase.co';
+const CONDUCTOR_SUPABASE_KEY='sb_publishable_Ur6yP5_7LQ-9DGmriBJIpw_zIWJiM7T';
+const CONDUCTOR_CITY_ID='conductor-live-city';
+let conductorClient=null,conductorChannel=null,conductorSyncTimer=null,conductorSyncBusy=false;
+let conductorLiveShiftId=null,conductorPreviousView=null,conductorLastStopIndex=null;
 
 /* ═══════════════ ШРИФТ 5×7 (LED-матрица) ═══════════════ */
 const F={};
@@ -967,10 +981,28 @@ function normalize(o){
   o.sim=Object.assign({},d.sim,o.sim||{});
   o.log=Array.isArray(o.log)?o.log.slice(0,200):[];
   o.rail.trains=o.rail.trains||[];o.rail.sections=o.rail.sections||[];
-  o.city.trips=o.city.trips||[];o.city.cities=o.city.cities||[];
+  o.city.trips=(o.city.trips||[]).filter(t=>!t.conductorLive);
+  o.city.cities=(o.city.cities||[]).filter(c=>c.id!==CONDUCTOR_CITY_ID&&!c.conductorLinked);
+  if(!o.city.cities.some(c=>c.id===o.city.activeCity)){
+    o.city.activeCity=(o.city.cities[0]||{}).id||null;
+    o.city.activeStop='all';
+  }
   return o;
 }
-const saveNow=()=>{try{localStorage.setItem(KEY,JSON.stringify(state));const el=$('saveInfo');if(el)el.textContent='Сохранено в браузере · '+fmtSec(state.sim.sec)}catch(e){}};
+function persistentState(){
+  const copy=JSON.parse(JSON.stringify(state));
+  copy.city.trips=(copy.city.trips||[]).filter(t=>!t.conductorLive);
+  copy.city.cities=(copy.city.cities||[]).filter(c=>c.id!==CONDUCTOR_CITY_ID&&!c.conductorLinked);
+  if(copy.city.activeCity===CONDUCTOR_CITY_ID){
+    const previous=conductorPreviousView||{};
+    const previousCity=copy.city.cities.find(c=>c.id===previous.activeCity);
+    copy.city.activeCity=previousCity?previousCity.id:((copy.city.cities[0]||{}).id||null);
+    copy.city.activeStop=previousCity&&previousCity.stops.some(s=>s.id===previous.activeStop)?previous.activeStop:'all';
+    if(previous.mode)copy.mode=previous.mode;
+  }
+  return copy;
+}
+const saveNow=()=>{try{localStorage.setItem(KEY,JSON.stringify(persistentState()));const el=$('saveInfo');if(el)el.textContent='Сохранено в браузере · '+fmtSec(state.sim.sec)}catch(e){}};
 const save=debounce(saveNow,700);
 function pushUndo(label){undoStack.push({label,snap:JSON.stringify(state)});if(undoStack.length>15)undoStack.shift()}
 function undo(){
@@ -1046,6 +1078,7 @@ function railStatus(tr,pointId,now){
   return{code:'rasp',...ST.rasp,arr,dep,sortT};
 }
 function cityStatus(t,now){
+  if(t.conductorLive)return{code:'board',...ST.board,sortT:t.time||now};
   const adj=t.time+t.delay;
   if(t.cancelled)return{code:'cancel',...ST.cancel,sortT:adj};
   if(t.gone&&!t.pinned)return{code:'gone',...ST.gone,sortT:adj};
@@ -1633,6 +1666,132 @@ function renderAll(){
   renderTopbar();renderControls();renderChips();renderTimeStrip();renderTabs();
   renderTab1();renderTab2();renderTab3();
   boardDirty=true;fitBoard();renderSr();
+}
+
+
+/* ═══════════════ СВЯЗЬ С КОНДУКТОРОМ ═══════════════ */
+function setConductorSync(label,status=''){
+  const el=$('conductorSync');if(!el)return;
+  el.className='syncchip'+(status?' '+status:'');
+  const text=el.querySelector('span');if(text)text.textContent=label;
+}
+function clearConductorTrip(){
+  const wasLinked=state.city.activeCity===CONDUCTOR_CITY_ID;
+  const hadLinked=state.city.cities.some(c=>c.id===CONDUCTOR_CITY_ID||c.conductorLinked)||state.city.trips.some(t=>t.conductorLive);
+  state.city.trips=state.city.trips.filter(t=>!t.conductorLive);
+  state.city.cities=state.city.cities.filter(c=>c.id!==CONDUCTOR_CITY_ID&&!c.conductorLinked);
+  if(wasLinked){
+    const previous=conductorPreviousView||{};
+    const previousCity=state.city.cities.find(c=>c.id===previous.activeCity);
+    state.city.activeCity=previousCity?previousCity.id:((state.city.cities[0]||{}).id||null);
+    state.city.activeStop=previousCity&&previousCity.stops.some(s=>s.id===previous.activeStop)?previous.activeStop:'all';
+    if(state.mode==='city'&&previous.mode)state.mode=previous.mode;
+  }
+  conductorLiveShiftId=null;
+  conductorPreviousView=null;
+  conductorLastStopIndex=null;
+  if(hadLinked){
+    prevStatus={};statusInit=false;
+    renderAll();boardDirty=true;save();
+  }
+}
+function queueConductorSync(){
+  clearTimeout(conductorSyncTimer);
+  conductorSyncTimer=setTimeout(()=>syncConductorTrip(),180);
+}
+async function syncConductorTrip(){
+  if(!conductorClient||conductorSyncBusy)return;
+  conductorSyncBusy=true;
+  try{
+    const shiftQuery=await conductorClient.from('conductor_shifts')
+      .select('*').eq('status','open').order('started_at',{ascending:false}).limit(1).maybeSingle();
+    if(shiftQuery.error)throw shiftQuery.error;
+    const shift=shiftQuery.data;
+    if(!shift||!shift.route_id){
+      clearConductorTrip();
+      setConductorSync(shift?'Ожидает назначения маршрута':'Ожидание рейса','ok');
+      return;
+    }
+    const routeQuery=await conductorClient.from('conductor_routes')
+      .select('*').eq('id',shift.route_id).is('archived_at',null).maybeSingle();
+    if(routeQuery.error)throw routeQuery.error;
+    const route=routeQuery.data;
+    if(!route||!Array.isArray(route.stops)||route.stops.length<1){
+      clearConductorTrip();
+      setConductorSync('Маршрут не найден','error');
+      return;
+    }
+    let vehicle=null;
+    if(shift.vehicle_id){
+      const vehicleQuery=await conductorClient.from('conductor_vehicles')
+        .select('number,model').eq('id',shift.vehicle_id).maybeSingle();
+      if(vehicleQuery.error)throw vehicleQuery.error;
+      vehicle=vehicleQuery.data;
+    }
+    const isNewShift=conductorLiveShiftId!==shift.id;
+    if(isNewShift){
+      conductorPreviousView={mode:state.mode,activeCity:state.city.activeCity,activeStop:state.city.activeStop};
+    }
+    const cityName=route.city||'Тверь';
+    const stopNames=route.stops.map(s=>typeof s==='string'?s:(s?.name||String(s||''))).filter(Boolean);
+    if(!stopNames.length){
+      clearConductorTrip();
+      setConductorSync('В маршруте нет остановок','error');
+      return;
+    }
+    const maxIndex=stopNames.length-1;
+    const currentIndex=Math.max(0,Math.min(Number(shift.current_stop_index)||0,maxIndex));
+    const endIndex=Math.max(currentIndex,Math.min(Number(shift.end_stop_index??maxIndex),maxIndex));
+    const city=state.city.cities.find(c=>c.id===CONDUCTOR_CITY_ID)||{
+      id:CONDUCTOR_CITY_ID,name:cityName,stops:[],conductorLinked:true
+    };
+    city.name=cityName;
+    city.conductorLinked=true;
+    city.stops=stopNames.map((name,index)=>({id:'conductor-stop-'+index,name}));
+    if(!state.city.cities.some(c=>c.id===CONDUCTOR_CITY_ID))state.city.cities.push(city);
+    state.city.trips=state.city.trips.filter(t=>!t.conductorLive);
+    const startTime=parseTime(shift.game_time);
+    state.city.trips.push({
+      id:'conductor-live-'+shift.id,city:CONDUCTOR_CITY_ID,kind:'bus',
+      num:String(route.name||'—'),dest:stopNames[endIndex]||stopNames[stopNames.length-1],
+      stop:city.stops[currentIndex].id,time:startTime==null?Math.floor(state.sim.sec/60):startTime,
+      plat:String(vehicle?.number||shift.vehicle_label||'—'),delay:0,
+      cancelled:false,gone:false,pinned:true,conductorLive:true
+    });
+    const stopChanged=conductorLastStopIndex!==currentIndex;
+    if(isNewShift||(stopChanged&&state.mode==='city'&&state.city.activeCity===CONDUCTOR_CITY_ID)){
+      state.mode='city';
+      state.city.activeCity=CONDUCTOR_CITY_ID;
+      state.city.activeStop=city.stops[currentIndex].id;
+    }
+    conductorLiveShiftId=shift.id;
+    conductorLastStopIndex=currentIndex;
+    prevStatus={};statusInit=false;
+    renderAll();boardDirty=true;renderSr();save();
+    setConductorSync('Рейс '+String(route.name||'')+' · онлайн','ok');
+  }catch(error){
+    console.error('Conductor sync:',error);
+    setConductorSync('Ошибка связи с Кондуктором','error');
+  }finally{
+    conductorSyncBusy=false;
+  }
+}
+function initConductorSync(){
+  if(!window.supabase||typeof window.supabase.createClient!=='function'){
+    setConductorSync('Клиент БД не загружен','error');return;
+  }
+  conductorClient=window.supabase.createClient(CONDUCTOR_SUPABASE_URL,CONDUCTOR_SUPABASE_KEY);
+  setConductorSync('Подключение к Кондуктору…');
+  conductorChannel=conductorClient.channel('tablo-conductor-live')
+    .on('postgres_changes',{event:'*',schema:'public',table:'conductor_shifts'},queueConductorSync)
+    .on('postgres_changes',{event:'*',schema:'public',table:'conductor_routes'},queueConductorSync)
+    .on('postgres_changes',{event:'*',schema:'public',table:'conductor_vehicles'},queueConductorSync)
+    .subscribe(status=>{
+      if(status==='SUBSCRIBED'){setConductorSync('Связь с Кондуктором активна','ok');syncConductorTrip()}
+      else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED')setConductorSync('Realtime недоступен · проверка по таймеру','error');
+    });
+  syncConductorTrip();
+  setInterval(syncConductorTrip,15000);
 }
 
 /* ═══════════════ КАРТОЧКА РЕЙСА (drawer) ═══════════════ */
@@ -2237,6 +2396,7 @@ renderSr();
 requestAnimationFrame(loop);
 requestAnimationFrame(()=>{fitBoard();boardDirty=true});
 saveNow();
+initConductorSync();
 })();
 </script>
 </body>

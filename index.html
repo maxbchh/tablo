@@ -1854,7 +1854,7 @@ async function syncConductorTrip(){
       id:'conductor-live-'+shift.id,city:CONDUCTOR_CITY_ID,kind:'bus',
       num:String(route.name||'—'),dest:stopNames[endIndex]||stopNames[stopNames.length-1],
       stop:city.stops[currentIndex].id,time:startTime==null?Math.floor(state.sim.sec/60):startTime,
-      plat:'—',delay:0,
+      plat:'',delay:0,
       cancelled:false,gone:false,pinned:true,conductorLive:true
     });
     const stopChanged=conductorLastStopIndex!==currentIndex;
